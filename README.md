@@ -14,8 +14,7 @@ Ce dépôt fournit un environnement Docker complet pour démontrer une attaque d
 ## Lancer la démo
 
 ```bash
-docker compose build
-docker compose up -d
+docker-compose up --build
 ```
 
 Les conteneurs sont placés sur le réseau dédié `arpnet` avec des adresses fixes :
@@ -33,7 +32,7 @@ Le générateur de trafic (`victim`) émet une requête toutes les 4 secondes. L
 Affichez les journaux de l'attaquant pour voir les paquets interceptés :
 
 ```bash
-docker compose logs -f attacker
+docker-compose logs -f attacker
 ```
 
 Exemple obtenu lors d'un run :
@@ -59,14 +58,14 @@ On observe que l'attaquant reçoit et relaie les requêtes POST de la victime *e
 Vous pouvez également consulter les journaux de la victime ou du serveur :
 
 ```bash
-docker compose logs victim
-docker compose logs server
+docker-compose logs victim
+docker-compose logs server
 ```
 
 ## Arrêter et nettoyer
 
 ```bash
-docker compose down
+docker-compose down
 ```
 
 ## Personnalisation
